@@ -93,15 +93,20 @@ class Attention(nn.Module):
         x = self.relu(x)
         return self.func_channel(x), self.func_filter(x), self.func_spatial(x), self.func_kernel(x)
 
-
-def dwt_init(x):
-
-    x01 = x[:, :, 0::2, :] / 2
-    x02 = x[:, :, 1::2, :] / 2
-    x1 = x01[:, :, :, 0::2]
-    x2 = x02[:, :, :, 0::2]
-    x3 = x01[:, :, :, 1::2]
-    x4 = x02[:, :, :, 1::2]
+# Haar DWT 分解函数
+def dwt_init(x): # B, C, H, W -> 4*(B, C, H/2, W/2)
+    """
+    除以 2 是做 Haar 小波的系数归一：
+        对相邻 2×2 像素先下采样再线性组合，如果不缩放，LL/HL/LH/HH 子带的数值范围会成倍放大，能量不匹配；
+        加上 1/2 让子带幅值与原图同量级，便于后续计算和与逆变换（iwt_init）配对还原时保持尺度一致，避免数值过大或梯度不稳定。
+    """
+    
+    x01 = x[:, :, 0::2, :] / 2 # 取偶数行子采样（行步长2），并除以 2 做系数归一
+    x02 = x[:, :, 1::2, :] / 2 # 取奇数行子采样（行步长2），并除以 2 做系数归一
+    x1 = x01[:, :, :, 0::2] #  在偶数行子采样基础上再取偶数列，得到左上子块
+    x2 = x02[:, :, :, 0::2] # 奇数行 + 偶数列，左下子块
+    x3 = x01[:, :, :, 1::2] # 偶数行 + 奇数列，右上子块
+    x4 = x02[:, :, :, 1::2] # 奇数行 + 奇数列，右下子块
     x_LL = x1 + x2 + x3 + x4
     x_HL = -x1 - x2 + x3 + x4
     x_LH = -x1 + x2 - x3 + x4
@@ -109,8 +114,8 @@ def dwt_init(x):
 
     return x_LL, x_HL, x_LH, x_HH
 
-
-def iwt_init(x):
+# Haar IWT 重构函数
+def iwt_init(x): # [B, 4*C, H, W] -> [B, C, 2H, 2W]
     r = 2
     in_batch, in_channel, in_height, in_width = x.size()
     out_batch, out_channel, out_height, out_width = in_batch,int(in_channel/(r**2)), r * in_height, r * in_width
@@ -129,8 +134,12 @@ def iwt_init(x):
 
     return h
 
-
+# DWT 类
 class DWT(nn.Module):
+    """
+    super(DWT, self).__init__() 调用父类 nn.Module 的构造函数，完成模块注册、参数/缓冲区初始化等基础设置。
+    通常在自定义 nn.Module 时都要调用一次，否则父类的内部状态（如 parameters() 收集、to()/cuda() 等）可能不完整。
+    """
     def __init__(self):
         super(DWT, self).__init__()
         self.requires_grad = False  
@@ -138,7 +147,7 @@ class DWT(nn.Module):
     def forward(self, x):
         return dwt_init(x)
 
-
+# IWT 类
 class IWT(nn.Module):
     def __init__(self):
         super(IWT, self).__init__()
@@ -160,9 +169,9 @@ class LayerNorm(nn.Module):
         self.normalized_shape = (normalized_shape, )
 
     def forward(self, x):
-        if self.data_format == "channels_last":
+        if self.data_format == "channels_last": # 如果是 channels_last 格式，直接调用 PyTorch 内置的 layer_norm
             return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
-        elif self.data_format == "channels_first":
+        elif self.data_format == "channels_first": # channels_first 格式需要手动计算：通道维均值 u 和方差 s，做归一化 (x - u) / sqrt(s + eps)。
             u = x.mean(1, keepdim=True)
             s = (x - u).pow(2).mean(1, keepdim=True)
             x = (x - u) / torch.sqrt(s + self.eps)
@@ -211,20 +220,21 @@ class SimpleGate(nn.Module):
         x1, x2 = x.chunk(2, dim=1)
         return x1 * x2
 
+# GFFN
 class ffn(nn.Module):
     def __init__(self, num_feat, ffn_expand=2):
         super(ffn, self).__init__()
 
         dw_channel = num_feat * ffn_expand
-        self.conv1 = nn.Conv2d(num_feat, dw_channel, kernel_size=1, padding=0, stride=1)
-        self.conv2 = nn.Conv2d(dw_channel, dw_channel, kernel_size=3, padding=1, stride=1, groups=dw_channel)
-        self.conv3 = nn.Conv2d(dw_channel//2, num_feat, kernel_size=1, padding=0, stride=1)
+        self.conv1 = nn.Conv2d(num_feat, dw_channel, kernel_size=1, padding=0, stride=1) # 1*1扩展通道（相当于点卷积 PConv）
+        self.conv2 = nn.Conv2d(dw_channel, dw_channel, kernel_size=3, padding=1, stride=1, groups=dw_channel) # 3×3 depthwise（DWConv）
+        self.conv3 = nn.Conv2d(dw_channel//2, num_feat, kernel_size=1, padding=0, stride=1) # 1×1 收敛回原通道
         
         self.sg = SimpleGate()
 
     def forward(self, x):
         x = self.conv2(self.conv1(x))
-        x1, x2 = x.chunk(2, dim=1)
+        x1, x2 = x.chunk(2, dim=1) # x1, x2 = x.chunk(2, dim=1)
         x = F.gelu(x1)*x2
         # x = x * self.sca(x)
         x = self.conv3(x)
@@ -313,6 +323,7 @@ class AttBlock(nn.Module):
         y = self.fc(self.norm2(y)) + y
         return y
 
+# VSSM
 class SS2D(nn.Module):
     def __init__(
             self,
@@ -339,10 +350,10 @@ class SS2D(nn.Module):
         self.d_state = d_state
         self.d_conv = d_conv
         self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
+        self.d_inner = int(self.expand * self.d_model) # 中间维度
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
 
-        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs) # 线性投影，将通道投影到 2*d_inner
         self.conv2d = nn.Conv2d(
             in_channels=self.d_inner,
             out_channels=self.d_inner,
@@ -354,6 +365,7 @@ class SS2D(nn.Module):
         )
         self.act = nn.SiLU()
 
+        # 构建 4 组线性映射 x_proj（每组输出 dt_rank + 2*d_state），权重堆叠为参数 x_proj_weight
         self.x_proj = (
             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
@@ -361,7 +373,7 @@ class SS2D(nn.Module):
             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
         )
         self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))  # (K=4, N, inner)
-        del self.x_proj
+        del self.x_proj # 删除原 ModuleList 节省开销
 
         self.dt_projs = (
             self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
@@ -377,15 +389,16 @@ class SS2D(nn.Module):
         self.dt_projs_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_projs], dim=0))  # (K=4, inner)
         del self.dt_projs
 
-        self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=4, merge=True)  # (K=4, D, N)
-        self.Ds = self.D_init(self.d_inner, copies=4, merge=True)  # (K=4, D, N)
+        self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=4, merge=True)  # (K=4, D, N) 可学习的对数状态矩阵 A_logs（S4D 初始化）
+        self.Ds = self.D_init(self.d_inner, copies=4, merge=True)  # (K=4, D, N) 跳连系数 Ds，各复制4份后展平
 
         self.selective_scan = selective_scan_fn
 
         self.out_norm = nn.LayerNorm(self.d_inner)
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs) # 线性映射回 d_model 维
         self.dropout = nn.Dropout(dropout) if dropout > 0. else None
-
+    
+    # 创建并初始化 dt_proj：权重随机/常数初始化，偏置初始化到 softplus 后落在 [dt_min, dt_max] 区间，并标记不重置
     @staticmethod
     def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
                 **factory_kwargs):
@@ -443,6 +456,7 @@ class SS2D(nn.Module):
         D._no_weight_decay = True
         return D
 
+    # 2D-SSM
     def forward_core(self, x: torch.Tensor):
         B, C, H, W = x.shape
         L = H * W
@@ -527,21 +541,30 @@ class LFSSBlock(nn.Module):
         x = x.view(B, -1, C).contiguous()
         return x
 
-
-
+"""
+LayerNormFunction
+自定义了适用于 NCHW 格式按通道维度的层归一化的前向与反向，
+作为 LayerNorm2d 的底层实现，以便显式控制数值和梯度。
+    继承了 torch.autograd.Function，一旦用自定义的 forward，
+    框架不会自动推导反向，因此必须显式实现 backward。常见目的有：
+    1.控制梯度公式和数值稳定性（手写 LN 的反向）
+    2.减少保存的中间状态/显存占用，避免构建多余的计算图，提升性能。
+    3.适配特定数据格式（NCHW）的 LayerNorm，而不依赖默认实现的自动求导
+"""
 class LayerNormFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, weight, bias, eps):
-        ctx.eps = eps
+        ctx.eps = eps # ctx 用于保存反向所需信息
         N, C, H, W = x.size()
         mu = x.mean(1, keepdim=True)
         var = (x - mu).pow(2).mean(1, keepdim=True)
         y = (x - mu) / (var + eps).sqrt()
-        ctx.save_for_backward(y, var, weight)
+        ctx.save_for_backward(y, var, weight) # 将归一化结果、方差和 weight 保存，供反向使用
         y = weight.view(1, C, 1, 1) * y + bias.view(1, C, 1, 1)
         return y
 
+    # 返回对 x的梯度、weight的梯度、bias的梯度、eps的梯度（None，因为 eps 不参与求导）
     @staticmethod
     def backward(ctx, grad_output):
         eps = ctx.eps
@@ -568,16 +591,22 @@ class LayerNorm2d(nn.Module):
     def forward(self, x):
         return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
 
-
+"""
+Get_gradient_nopadding 
+    计算输入特征（NCHW）每个通道的水平、垂直梯度和梯度幅值，
+    用固定的 Sobel 风格卷积核（不参与训练）
+"""
 class Get_gradient_nopadding(nn.Module):
     def __init__(self):
         super(Get_gradient_nopadding, self).__init__()
-        kernel_v = [[0, -1, 0], 
+        kernel_v = [[0, -1, 0], # 构造垂直梯度卷积核
                     [0, 0, 0], 
                     [0, 1, 0]]
-        kernel_h = [[0, 0, 0], 
+        kernel_h = [[0, 0, 0], # 构造水平梯度卷积核
                     [-1, 0, 1], 
                     [0, 0, 0]]
+        
+        # 将两个 3×3 kernel 转为 FloatTensor 并扩展维度为 [1,1,3,3]，适配 conv2d
         kernel_h = torch.FloatTensor(kernel_h).unsqueeze(0).unsqueeze(0)
         kernel_v = torch.FloatTensor(kernel_v).unsqueeze(0).unsqueeze(0)
         self.weight_h = nn.Parameter(data = kernel_h, requires_grad = False)
