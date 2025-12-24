@@ -914,7 +914,7 @@ class HFEBlock(nn.Module):
             x = x + self.ffn(self.norm2(x))
         return x
 
-
+# Frequency_fusion 用在哪里了？
 class Frequency_fusion(nn.Module):
     def __init__(self, in_c=3, dim=48):
         super(Frequency_fusion, self).__init__()
@@ -935,7 +935,12 @@ class Frequency_fusion(nn.Module):
 
         return perception
 
-
+"""
+ConvNeXtBlock
+    实现 ConvNeXt 风格的残差块：深度卷积做局部建模，
+    通道顺序切到 NHWC 后用两层线性（等价 1×1 卷积）+ GELU 组成逐通道前馈，
+    再可选层尺度 γ、随机深度，最后残差加回
+"""
 class ConvNeXtBlock(nn.Module):
     r""" ConvNeXt Block. There are two equivalent implementations:
     (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
