@@ -609,32 +609,38 @@ class Get_gradient_nopadding(nn.Module):
         # 将两个 3×3 kernel 转为 FloatTensor 并扩展维度为 [1,1,3,3]，适配 conv2d
         kernel_h = torch.FloatTensor(kernel_h).unsqueeze(0).unsqueeze(0)
         kernel_v = torch.FloatTensor(kernel_v).unsqueeze(0).unsqueeze(0)
+        # 注册为不可训练参数
         self.weight_h = nn.Parameter(data = kernel_h, requires_grad = False)
-        
         self.weight_v = nn.Parameter(data = kernel_v, requires_grad = False)
         
 
     def forward(self, x):
-        x_list = []
-        x_h_list=[]
-        x_v_list=[]
-        for i in range(x.shape[1]):
+        x_list = [] # 存储每个通道的梯度幅值
+        x_h_list=[] # 存储每个通道的水平梯度
+        x_v_list=[] # 存储每个通道的垂直梯度
+        for i in range(x.shape[1]): # 遍历每个通道
             x_i = x[:, i]
             x_i_v = F.conv2d(x_i.unsqueeze(1), self.weight_v, padding=1)
             x_i_h = F.conv2d(x_i.unsqueeze(1), self.weight_h, padding=1)
-            x_i = torch.sqrt(torch.pow(x_i_v, 2) + torch.pow(x_i_h, 2) + 1e-6)
+            x_i = torch.sqrt(torch.pow(x_i_v, 2) + torch.pow(x_i_h, 2) + 1e-6) # sqrt(x_i_v^2 + x_i_h^2 + 1e-6)
             x_list.append(x_i)
             x_h_list.append(x_i_h)
             x_v_list.append(x_i_v)
 
+        # 在通道维拼接各列表，得到 x（幅值）、x_h（水平）、x_v（垂直），形状 [B,C,H,W]
         x = torch.cat(x_list, dim = 1)
         x_h = torch.cat(x_h_list, dim=1)
         x_v = torch.cat(x_v_list, dim=1)
         
         return x_h, x_v, x
 
-
+# batched_index_select 在指定维度上按批次选择元素(看不懂具体实现过程)
+# 应该是用于 HFEB 中
 def batched_index_select(input, dim, index):
+    """
+    遍历输入的各维，除目标维 dim 外，
+    在索引上插入长度为1的新维度（unsqueeze），以便后续广播
+    """
     for ii in range(1, len(input.shape)):
         if ii != dim:
             index = index.unsqueeze(ii)
@@ -644,6 +650,12 @@ def batched_index_select(input, dim, index):
     index = index.expand(expanse)
     return torch.gather(input, dim, index)
 
+
+"""
+neirest_neighbores
+在给定距离矩阵下，为每个样本从 candidate_maps 里按最小距离选择 num_matches 个通道的候选特征
+（目前实现等价于每通道取距离最小的一个，再按全局排序截取前 num_matches），返回筛选后的候选特征张量
+"""
 def neirest_neighbores(input_maps, candidate_maps, distances, num_matches):
     batch_size = input_maps.size(0) # B
 
@@ -694,6 +706,7 @@ def neirest_neighbores_on_l2(input_maps, candidate_maps, num_matches):
     
     return neirest_neighbores(input_maps, candidate_maps, distances, num_matches)
 
+# FMT 中的一部分。计算x与perception的相似度矩阵，为每个通道选取最相似的候选特征图
 class Matching(nn.Module):
     def __init__(self, dim=32, match_factor=1):
         super(Matching, self).__init__()
@@ -708,7 +721,7 @@ class Matching(nn.Module):
         filtered_candidate_maps = filtered_candidate_maps.reshape(b, self.num_matching, h, w)
         return filtered_candidate_maps
 
-
+# FMT 中的一部分。对拼接特征做 1×1 + 3×3 卷积和门控，输出通道缩到 dim/2 后再用于注意力或 FFN 后续计算
 class PAConv(nn.Module):
 
     def __init__(self, nf, k_size=3):
@@ -720,14 +733,15 @@ class PAConv(nn.Module):
 
     def forward(self, x):
 
-        y = self.k2(x)
-        y = self.sigmoid(y)
+        y = self.k2(x) # [B, nf, H, W]
+        y = self.sigmoid(y) # [B, nf, H, W]
 
-        out = torch.mul(self.k3(x), y)
-        out = self.k4(out)
+        out = torch.mul(self.k3(x), y) # [B, nf, H, W]
+        out = self.k4(out) # [B, nf//2, H, W]
 
         return out
 
+# FMTA 中的 FMT
 class Matching_transformation(nn.Module):
     def __init__(self, dim=32, match_factor=1, ffn_expansion_factor=1, bias=True):
         super(Matching_transformation, self).__init__()
@@ -747,6 +761,8 @@ class Matching_transformation(nn.Module):
 
         return out
 
+# FeedForward 是包含FMT的 FCFN 模块。
+# 先 1×1→DWConv 投影，再可选 Matching_transformation 将 perception 特征匹配融合，最后 DWConv+GELU+1×1 输出，支持感知特征参与
 class FeedForward(nn.Module):
     def __init__(self, dim=32, match_factor=4, ffn_expansion_factor=1, bias=True, ffn_matching=True):
         super(FeedForward, self).__init__()
@@ -782,14 +798,15 @@ class FeedForward(nn.Module):
 
 
 ##########################################################################
+# CMTAttention 是 FMTA 模块中排除 layernorm 之外的部分
 class CMTAttention(nn.Module):
     def __init__(self, dim, num_heads, match_factor=4,ffn_expansion_factor=1,scale_factor=8, bias=True, attention_matching=True):
         super(CMTAttention, self).__init__()
         self.num_heads = num_heads
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
 
-        self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=bias)
-        self.qkv_dwconv = nn.Conv2d(dim * 3, dim * 3, kernel_size=3, stride=1, padding=1, groups=dim * 3, bias=bias)
+        self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=bias) # 1*1 conv 相当于线性层，实现 通道*3 映射
+        self.qkv_dwconv = nn.Conv2d(dim * 3, dim * 3, kernel_size=3, stride=1, padding=1, groups=dim * 3, bias=bias) # depthwise conv 3*3
         self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
         self.matching = attention_matching
         if self.matching is True:
@@ -809,24 +826,35 @@ class CMTAttention(nn.Module):
             q = self.matching_transformation(q, perception)
         else:
             q = q
+        """
+        假定 q 形状原本是 [B, head*C, H, W]（通道维已经乘上了头数）
+        用 rearrange 将通道拆成 [head, C]，并把空间维 (H,W) 展平成一维序列，得到新形状 [B, head, C, H*W]，以便按多头把每个空间位置当作序列元素做注意力
+            rearrange：einops 库的张量重排工具，可用类似爱因斯坦求和的模式字符串描述维度的拆分/合并/重排，比 view/permute 组合更直观。
+            例如 'b (head c) h w -> b head c (h w)' 表示把某维拆分成两个新维，并把两个空间维合并
+        """
         q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
         k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
         v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
 
+        # 多头注意力：
+        # 在最后一维做 L2 归一化，确保向量长度为 1，便于稳定余弦相似度
         q = torch.nn.functional.normalize(q, dim=-1)
         k = torch.nn.functional.normalize(k, dim=-1)
 
+        # 对每个 head 计算内积得到注意力分数矩阵
+        # q/k 形状为 [B, head, C, L]，结果为 [B, head, C, C]，相当于通道间的相似度），再乘以可学习的温度系数
         attn = (q @ k.transpose(-2, -1)) * self.temperature
-        attn = attn.softmax(dim=-1)
+        attn = attn.softmax(dim=-1) # 对最后一维做 softmax，将分数转为权重
 
-        out = (attn @ v)
+        out = (attn @ v) # 用权重矩阵对 v 进行加权求和 [B, head, C, L]
 
-        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w) # b (head c) h w
 
-        out = self.project_out(out)
+        out = self.project_out(out) # 将多头注意力的输出映射回原始通道数
         return out
 
-
+# FeedForward_Restormer 是不包含FMT的 FCFN 模块
+# 简化版 Restormer 风格前馈，不含匹配。1×1 投影到 2×隐藏维，DWConv，通道二分做门控（GELU×），再 1×1 回到原维，仅依赖自身特征
 class FeedForward_Restormer(nn.Module):
     def __init__(self, dim, ffn_expansion_factor=1, bias=True):
         super(FeedForward_Restormer, self).__init__()
@@ -847,7 +875,11 @@ class FeedForward_Restormer(nn.Module):
         x = self.project_out(x)
         return x
 
-
+"""
+HFEBlock
+    ffn_restormer=False（默认）→ 使用带匹配的 FeedForward，需要 perception 输入（低频增强信息）来做 FMT
+    ffn_restormer=True → 使用 FeedForward_Restormer，不做匹配，只用自身高频特征；前向时会在 forward 内根据该标志调用对应 FFN
+"""
 class HFEBlock(nn.Module):
     def __init__(self, dim=48, num_heads=1, match_factor=4, ffn_expansion_factor=1, bias=True, attention_matching=True, ffn_matching=True, ffn_restormer=False):
         super(HFEBlock, self).__init__()
