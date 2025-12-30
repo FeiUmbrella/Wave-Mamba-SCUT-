@@ -1,6 +1,6 @@
 # Modified from: https://github.com/facebookresearch/fvcore/blob/master/fvcore/common/registry.py  # noqa: E501
 
-
+# Registry 定义注册表类，负责“名字 -> 对象”的映射
 class Registry():
     """
     The registry that provides name -> object mapping, to support third-party
@@ -27,20 +27,20 @@ class Registry():
         BACKBONE_REGISTRY.register(MyBackbone)
     """
 
-    def __init__(self, name):
+    def __init__(self, name): # 构造函数，注册表要有名称
         """
         Args:
             name (str): the name of this registry
         """
-        self._name = name
+        self._name = name # 注册表名字（用于报错信息）
         self._obj_map = {}
 
-    def _do_register(self, name, obj):
+    def _do_register(self, name, obj): # 内部注册方法
         assert (name not in self._obj_map), (f"An object named '{name}' was already registered "
                                              f"in '{self._name}' registry!")
-        self._obj_map[name] = obj
+        self._obj_map[name] = obj # 写入映射
 
-    def register(self, obj=None):
+    def register(self, obj=None): # 外部注册入口，可做装饰器或函数调用
         """
         Register the given object under the the name `obj.__name__`.
         Can be used as either a decorator or not.
@@ -74,7 +74,7 @@ class Registry():
     def keys(self):
         return self._obj_map.keys()
 
-
+# 若干注册表实例，每个注册表实例中包含若干“名字 -> 对象”映射
 DATASET_REGISTRY = Registry('dataset')
 ARCH_REGISTRY = Registry('arch')
 MODEL_REGISTRY = Registry('model')

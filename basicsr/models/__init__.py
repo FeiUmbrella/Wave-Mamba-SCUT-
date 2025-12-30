@@ -15,7 +15,10 @@ model_filenames = [osp.splitext(osp.basename(v))[0] for v in scandir(model_folde
 # import all the model modules
 _model_modules = [importlib.import_module(f'basicsr.models.{file_name}') for file_name in model_filenames]
 
-
+"""
+build_model
+    根据配置 opt['model_type'] 从模型注册表里取出对应的模型类并实例化，返回模型对象，同时记录日志
+"""
 def build_model(opt):
     """Build model from options.
 

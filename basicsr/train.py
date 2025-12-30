@@ -19,7 +19,7 @@ from basicsr.utils.options import copy_opt_file, dict2str, parse_options
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = '5'
 
-def mkdir_and_rename(path): #创建对应的实验的文件夹
+def mkdir_and_rename(path): #创建对应的实验的文件夹，在原目录名后附加时间戳重命名并转移，随后再创建同名的新目录，避免旧日志或配置被覆盖
     """mkdirs. If path exists, rename it with timestamp and create a new one.
 
     Args:
@@ -27,9 +27,9 @@ def mkdir_and_rename(path): #创建对应的实验的文件夹
     """
     if osp.exists(path):
         new_name = path + '_archived_' + get_time_str()
-        new_name = new_name.replace('tb_logger', 'tb_logger_archived')
+        new_name = new_name.replace('tb_logger', 'tb_logger_archived') # 替换为 tb_logger_archived，使 TensorBoard 目录的归档更直观
         print(f'Path already exists. Rename it to {new_name}', flush=True)
-        shutil.move(path, new_name)
+        shutil.move(path, new_name) # 将旧目录整体移动到新的归档名称下
     os.makedirs(path, exist_ok=True)
 
 
@@ -94,30 +94,36 @@ def create_train_val_dataloader(opt, logger): #创建训练和测试的dataloade
         else:
             raise ValueError(f'Dataset phase {phase} is not recognized.')
 
-    return train_loader, train_sampler, val_loader, total_epochs, total_iters
+    """
+    # train_sampler 
+        是 basicsr.data.data_sampler.EnlargedSampler 的实例
+        是训练集的采样器，用于分布式训练场景下按 world_size/rank 切分数据，并通过 dataset_enlarge_ratio 做“数据扩增式重复采样”。
+    """
+    return train_loader, train_sampler, val_loader, total_epochs, total_iters 
 
+# 根据配置决定是否加载最近一次训练的断点（包含 epoch、iter、优化器状态等），以便训练被中断后从相同迭代继续
 def load_resume_state(opt): #读取训练断点状态
     resume_state_path = None
     #判断是否自动断点续训
     if opt['auto_resume']:
-        state_path = osp.join('experiments', opt['name'], 'training_states')
+        state_path = osp.join('experiments', opt['name'], 'training_states') # experiments/<exp_name>/training_states
         if osp.isdir(state_path):
-            states = list(scandir(state_path, suffix='state', recursive=False, full_path=False))
+            states = list(scandir(state_path, suffix='state', recursive=False, full_path=False)) # scandir 获取目录下所有 .state 文件列表
             if len(states) != 0:
-                states = [float(v.split('.state')[0]) for v in states]
-                resume_state_path = osp.join(state_path, f'{max(states):.0f}.state')
-                opt['path']['resume_state'] = resume_state_path
+                states = [float(v.split('.state')[0]) for v in states] # 将文件名去掉 .state 后转成浮点数，方便比较时间戳或迭代号
+                resume_state_path = osp.join(state_path, f'{max(states):.0f}.state') # 选取数值最大的断点（最新），组合成完整路径
+                opt['path']['resume_state'] = resume_state_path # 写回 opt['path']['resume_state']，方便后续逻辑复用
     else:
-        if opt['path'].get('resume_state'):
+        if opt['path'].get('resume_state'): # 未开启自动续训但手动指定了 opt['path']['resume_state']，直接采用该路径
             resume_state_path = opt['path']['resume_state']
 
-    if resume_state_path is None:
+    if resume_state_path is None: # 仍无可用路径，则返回 resume_state = None，代表从头训练
         resume_state = None
     else:
-        device_id = torch.cuda.current_device()
-        resume_state = torch.load(resume_state_path, map_location=lambda storage, loc: storage.cuda(device_id))
-        check_resume(opt, resume_state['iter'])
-    return resume_state
+        device_id = torch.cuda.current_device() # 读取当前 CUDA 设备 ID，以便映射加载的张量到正确 GPU
+        resume_state = torch.load(resume_state_path, map_location=lambda storage, loc: storage.cuda(device_id)) # 读取断点文件，并通过 map_location 把存储映射到当前设备
+        check_resume(opt, resume_state['iter']) # 调用 check_resume 校验配置与断点迭代号是否一致，防止错配
+    return resume_state # 返回最终的 resume_state（或 None），供训练主流程决定是否续训
 
 
 def train_pipeline(root_path): #训练的主要流程函数
@@ -126,8 +132,8 @@ def train_pipeline(root_path): #训练的主要流程函数
     opt, args = parse_options(root_path, is_train=True)
     opt['root_path'] = root_path
 
-    torch.backends.cudnn.benchmark = True
-    # torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True # 允许 cudnn 自动选择最快卷积算法以加速训练
+    # torch.backends.cudnn.deterministic = True # 设置为 True 则每次返回的卷积算法将是确定的，保证可复现但可能变慢降低性能
 
     # 如果需要则读取断点状态
     resume_state = load_resume_state(opt)
@@ -155,8 +161,8 @@ def train_pipeline(root_path): #训练的主要流程函数
     train_loader, train_sampler, val_loaders, total_epochs, total_iters = result
 
     # 创建模型
-    model = build_model(opt)
-    if resume_state:  # resume training
+    model = build_model(opt) # todo: build_model?
+    if resume_state:  # resume training  若有断点，走续训流程
         model.resume_training(resume_state)  # handle optimizers and schedulers
         logger.info(f"Resuming training from epoch: {resume_state['epoch']}, " f"iter: {resume_state['iter']}.")
         start_epoch = resume_state['epoch']
@@ -178,9 +184,9 @@ def train_pipeline(root_path): #训练的主要流程函数
     # 读取dataloader中的数据
     prefetch_mode = opt['datasets']['train'].get('prefetch_mode')
     if prefetch_mode is None or prefetch_mode == 'cpu':
-        prefetcher = CPUPrefetcher(train_loader)
+        prefetcher = CPUPrefetcher(train_loader) # 创建 CPU 预取器
     elif prefetch_mode == 'cuda':
-        prefetcher = CUDAPrefetcher(train_loader, opt)
+        prefetcher = CUDAPrefetcher(train_loader, opt) # 创建 CUDA 预取器
         logger.info(f'Use {prefetch_mode} prefetch dataloader')
         if opt['datasets']['train'].get('pin_memory') is not True:
             raise ValueError('Please set pin_memory=True for CUDAPrefetcher.')
@@ -190,17 +196,17 @@ def train_pipeline(root_path): #训练的主要流程函数
     # 开始进行训练
     logger.info(f'Start training from epoch: {start_epoch}, iter: {current_iter}')
     data_timer, iter_timer = AvgTimer(), AvgTimer()
-    start_time = time.time()
+    start_time = time.time() # 记录总训练起始时间
 
     # print('total_epochs',total_epochs)
 
     for epoch in range(start_epoch, total_epochs + 1):
-        train_sampler.set_epoch(epoch)
-        prefetcher.reset()
+        train_sampler.set_epoch(epoch) # 给采样器设置 epoch，保证分布式 shuffle 一致
+        prefetcher.reset() # 重置预取器，准备读新一轮数据
         train_data = prefetcher.next()
 
         while train_data is not None:
-            data_timer.record()
+            data_timer.record() # 记录数据加载耗时
 
             current_iter += 1
             if current_iter > total_iters:
@@ -208,11 +214,11 @@ def train_pipeline(root_path): #训练的主要流程函数
             # print('total_iters', total_iters)
             # print('current_iter', current_iter)
             # 更新模型的学习率
-            model.update_learning_rate(current_iter, warmup_iter=opt['train'].get('warmup_iter', -1))
+            model.update_learning_rate(current_iter, warmup_iter=opt['train'].get('warmup_iter', -1)) # 利用warmup设置学习率，具体流程 根据当前迭代与 warmup 配置更新学习率
             # 进行训练
-            model.feed_data(train_data)
-            model.optimize_parameters(current_iter)
-            iter_timer.record()
+            model.feed_data(train_data) # 将 batch 数据送入模型
+            model.optimize_parameters(current_iter) #  执行一次参数优化
+            iter_timer.record() # 记录本次迭代耗时
             if current_iter == 1:
                 # 重置msg_logger中的开始时间以获得更准确的eta_time
                 # 不在恢复模式下工作
@@ -242,11 +248,11 @@ def train_pipeline(root_path): #训练的主要流程函数
                 model.save(epoch, current_iter)
 
             # 进行模型验证
-            if opt.get('val') is not None and (current_iter % opt['val']['val_freq'] == 0):
+            if opt.get('val') is not None and (current_iter % opt['val']['val_freq'] == 0): # 若配置了验证且到达验证频率
                 if len(val_loaders) > 1:
                     logger.warning('Multiple validation datasets are *only* supported by SRModel.')
                 # for val_loader in val_loaders:
-                model.validation(val_loaders, current_iter,epoch, tb_logger, opt['val']['save_img'])
+                model.validation(val_loaders, current_iter,epoch, tb_logger, opt['val']['save_img']) # 执行验证并可选保存图像
 
             data_timer.start()
             iter_timer.start()
@@ -258,11 +264,11 @@ def train_pipeline(root_path): #训练的主要流程函数
     consumed_time = str(datetime.timedelta(seconds=int(time.time() - start_time)))
     logger.info(f'End of training. Time consumed: {consumed_time}')
     logger.info('Save the latest model.')
-    model.save(epoch=-1, current_iter=-1)  # -1 stands for the latest
+    model.save(epoch=-1, current_iter=-1)  # -1 stands for the latest 保存最新模型（-1 作为标记）
     if opt.get('val') is not None:
         # for val_loader in val_loaders:
-        model.validation(val_loaders, current_iter, tb_logger, opt['val']['save_img'])
-    if tb_logger:
+        model.validation(val_loaders, current_iter, tb_logger, opt['val']['save_img']) # 训练结束后再做一次验证
+    if tb_logger: # 若启用了 TensorBoard
         tb_logger.close()
 
 

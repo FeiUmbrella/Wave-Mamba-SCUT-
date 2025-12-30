@@ -985,7 +985,10 @@ class ConvNeXtBlock(nn.Module):
         x = input + self.drop_path(x)
         return x
 
-
+"""
+class SKFF
+    对多尺度/多分支特征进行通道自适应加权融合：先汇聚分支特征，生成每个分支的通道注意力权重，再加权求和输出
+"""
 class SKFF(nn.Module):
     def __init__(self, in_channels, height=3, reduction=8,bias=False):
         super(SKFF, self).__init__()
@@ -1002,29 +1005,33 @@ class SKFF(nn.Module):
         
         self.softmax = nn.Softmax(dim=1)
 
-    def forward(self, inp_feats):
+    def forward(self, inp_feats): # inp_feats：列表，长度=height，每个 [B, C, H, W]
         batch_size = inp_feats[0].shape[0]
         n_feats =  inp_feats[0].shape[1]
         
 
         inp_feats = torch.cat(inp_feats, dim=1)
-        inp_feats = inp_feats.view(batch_size, self.height, n_feats, inp_feats.shape[2], inp_feats.shape[3])
+        inp_feats = inp_feats.view(batch_size, self.height, n_feats, inp_feats.shape[2], inp_feats.shape[3]) # [B, height, C, H, W]
         
-        feats_U = torch.sum(inp_feats, dim=1)
-        feats_S = self.avg_pool(feats_U)
-        feats_Z = self.conv_du(feats_S)
+        feats_U = torch.sum(inp_feats, dim=1) # [B, C, H, W]
+        feats_S = self.avg_pool(feats_U) # [B, C, 1, 1]
+        feats_Z = self.conv_du(feats_S) # [B, d, 1, 1]（d=max(C/reduction,4)）
 
-        attention_vectors = [fc(feats_Z) for fc in self.fcs]
+        attention_vectors = [fc(feats_Z) for fc in self.fcs] # length=height，每个 [B, C, 1, 1]
         attention_vectors = torch.cat(attention_vectors, dim=1)
-        attention_vectors = attention_vectors.view(batch_size, self.height, n_feats, 1, 1)
+        attention_vectors = attention_vectors.view(batch_size, self.height, n_feats, 1, 1) # [B, height, C, 1, 1]
         # stx()
-        attention_vectors = self.softmax(attention_vectors)
+        attention_vectors = self.softmax(attention_vectors) # [B, height, C, 1, 1]
         
-        feats_V = torch.sum(inp_feats*attention_vectors, dim=1)
+        feats_V = torch.sum(inp_feats*attention_vectors, dim=1) # [B, C, H, W]
         
         return feats_V        
 
-
+"""
+DownFRG
+    下采样阶段的频率引导模块：先对输入做 DWT 拆成低/高频子带，低频通过若干 LFSSBlock 序列建模，
+    高频通过 SKFF 融合再用若干 HFEBlock、并用低频结果校正，输出处理后的低频 x_LL 和高频 x_h（尺寸为原图一半）
+"""
 class DownFRG(nn.Module):
     def __init__(self, dim, n_l_blocks=1, n_h_blocks=1, expand=2):
         super().__init__()
@@ -1036,20 +1043,21 @@ class DownFRG(nn.Module):
         self.h_blk = nn.Sequential(*[HFEBlock(dim, match_factor=1, ffn_expansion_factor=1) for _ in range(n_h_blocks)])
     
     def forward(self, x, x_d):
-        x_LL, x_HL, x_LH, x_HH = self.dwt(x)
+        x_LL, x_HL, x_LH, x_HH = self.dwt(x) # [B, dim, H/2, W/2]
         b, c, h, w = x_LL.shape
         x_LL = self.l_conv(torch.cat([x_LL, x_d], dim=1))
-        x_LL = rearrange(x_LL, "b c h w -> b (h w) c").contiguous()
+        x_LL = rearrange(x_LL, "b c h w -> b (h w) c").contiguous() # [B, (H/2*W/2), dim]
         for l_layer in self.l_blk:
             x_LL = l_layer(x_LL, [h, w])
-        x_LL = rearrange(x_LL, "b (h w) c -> b c h w", h=h, w=w).contiguous()
+        x_LL = rearrange(x_LL, "b (h w) c -> b c h w", h=h, w=w).contiguous() # [B, dim, H/2, W/2]
 
-        x_h = self.h_fusion([x_HL, x_LH, x_HH])
+        x_h = self.h_fusion([x_HL, x_LH, x_HH]) # [B, dim, H/2, W/2]
         for h_layer in self.h_blk:
             x_h = h_layer(x_h, x_LL)
         
-        return x_LL, x_h
+        return x_LL, x_h # 均为 [B, dim, H/2, W/2]
 
+# upFRG 上采样阶段，为下采样DownFRG的逆过程
 class upFRG(nn.Module):
     def __init__(self, dim, n_l_blocks=1, n_h_blocks=1, expand=2):
         super().__init__()
@@ -1073,7 +1081,7 @@ class upFRG(nn.Module):
 
         return x_l
 
-
+# UNet 文章的主干网络
 class UNet(nn.Module):
     def __init__(self, in_chn=3, wf=48, n_l_blocks=[1,1,2], n_h_blocks=[1,1,1], ffn_scale=2):
         super(UNet, self).__init__()
@@ -1128,20 +1136,27 @@ class UNet(nn.Module):
 
         return out_1
 
-    
+"""
+WaveMamba 
+    封装了前面定义的 UNet 主干，作为可注册的架构供 BasicSR 框架调用，提供前向/测试分块等接口。
+    @ARCH_REGISTRY.register() 装饰器：
+        将类注册到 BasicSR 的架构注册表，便于通过配置构建网络；
+        BasicSR 的 build_network 等工厂方法可通过配置名构建该模型，配置文件 options/train_wavemamba_lol.yml 中指定 type: WaveMamba 时即会实例化这里的类
+"""
 @ARCH_REGISTRY.register()
 class WaveMamba(nn.Module):
     def __init__(self,
                  *,
-                 in_chn,
-                 wf,
-                 n_l_blocks=[1,1,2],
-                 n_h_blocks=[1,1,1], 
-                 ffn_scale=2.0, 
+                 in_chn, # width factor 输入通道数
+                 wf, # 基础通道数
+                 n_l_blocks=[1,1,2],    # 低频块数量列表
+                 n_h_blocks=[1,1,1],  # 高频块数量列表
+                 ffn_scale=2.0,  # FFN 扩展因子
                  **ignore_kwargs):
         super().__init__()
         self.restoration_network = UNet(in_chn=in_chn, wf=wf, n_l_blocks=n_l_blocks, n_h_blocks=n_h_blocks, ffn_scale=ffn_scale)
 
+    # 辅助函数-打印模型结构与参数量
     def print_network(self, model):
         num_params = 0
         for p in model.parameters():
@@ -1149,20 +1164,26 @@ class WaveMamba(nn.Module):
         print(model)
         print("The number of parameters: {}".format(num_params))
 
+    # 前向入口，直接调用主干网络得到复原结果
     def encode_and_decode(self, input, current_iter=None):
 
         restoration = self.restoration_network(input)
         return restoration
 
     @torch.no_grad()
-    def test_tile(self, input, tile_size=240, tile_pad=16):
+    def test_tile(self, input, tile_size=240, tile_pad=16): # 将图片分块处理，进行对比试验的其他算法，然后拼接
         # return self.test(input)
         """It will first crop input images to tiles, and then process each tile.
         Finally, all the processed tiles are merged into one images.
         Modified from: https://github.com/xinntao/Real-ESRGAN/blob/master/realesrgan/utils.py
+
+        @param input: (4D Tensor) Input image, (N, C, H, W)
+        @param tile_size: (int) Tile size
+        @param tile_pad: (int) Tile padding                         这个参数是啥？
+        @return: (4D Tensor) Output image, (N, C, H, W)
         """
         batch, channel, height, width = input.shape
-        output_height = height * self.scale_factor
+        output_height = height * self.scale_factor # todo：self.scale_factor 在哪里定义了？
         output_width = width * self.scale_factor
         output_shape = (batch, channel, output_height, output_width)
 
@@ -1171,13 +1192,13 @@ class WaveMamba(nn.Module):
         tiles_x = math.ceil(width / tile_size)
         tiles_y = math.ceil(height / tile_size)
 
-        # loop over all tiles
+        # loop over all tiles 循环切片
         for y in range(tiles_y):
             for x in range(tiles_x):
                 # extract tile from input image
                 ofs_x = x * tile_size
                 ofs_y = y * tile_size
-                # input tile area on total image
+                # input tile area on total image 每片的四个边界坐标
                 input_start_x = ofs_x
                 input_end_x = min(ofs_x + tile_size, width)
                 input_start_y = ofs_y
@@ -1241,7 +1262,9 @@ class WaveMamba(nn.Module):
 
         return restoration
 
-
+"""
+    以下代码仅进行一次推理，用于测试模型的前向推理时间、显存占用，以及计算 FLOPs 和参数量
+"""
 if __name__== '__main__': 
     import os
     os.environ["CUDA_VISIBLE_DEVICES"] = '2'
@@ -1249,7 +1272,7 @@ if __name__== '__main__':
     x = torch.randn(1, 3, 1920, 1280).to(device)
     model = UNet(in_chn=3, wf=32, n_l_blocks=[1,2,4], n_h_blocks=[1,1,1], ffn_scale=2).to(device)
 #    print(model)
-    inp_shape=(3,512, 512)
+    inp_shape=(3,512, 512) # 定义用于 FLOPs/MACs 统计的输入形状
     from ptflops import get_model_complexity_info
     FLOPS = 0
     macs, params = get_model_complexity_info(model, inp_shape, verbose=False, print_per_layer_stat=True)
@@ -1257,17 +1280,17 @@ if __name__== '__main__':
     params = float(params[:-4])
     print('mac', macs)
     print(params)
-    macs = float(macs[:-4]) + FLOPS / 10 ** 9
+    macs = float(macs[:-4]) + FLOPS / 10 ** 9 # 将 macs 字符串同样截去单位并转换为浮点数，再把额外 FLOPS（默认为 0）按 GFLOPs 叠加
 
     print('mac', macs)
-    print(f'params: {sum(map(lambda x: x.numel(), model.parameters()))}')
+    print(f'params: {sum(map(lambda x: x.numel(), model.parameters()))}') # 通过 sum(map(lambda ...)) 得到的精确参数总数
     # print(flop_count_table(FlopCountAnalysis(model, x), activations=ActivationCountAnalysis(model, x)))
     with torch.no_grad():
-        torch.cuda.reset_max_memory_allocated(device)
+        torch.cuda.reset_max_memory_allocated(device) # 先重置 CUDA 已分配最大显存
         start_time = time.time()
-        output = model(x)
+        output = model(x) # 前向推理
         end_time = time.time()
-        memory_used = torch.cuda.max_memory_allocated(device)
+        memory_used = torch.cuda.max_memory_allocated(device) # 读取推理过程的最大显存使用
     running_time = end_time - start_time
     print(output.shape)
     print(running_time)
